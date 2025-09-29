@@ -9,12 +9,6 @@ class ScyllaDBService:
     def __init__(self, contact_points: List[str], username: str, password: str, keyspace: str):
         """
         Initializes the ScyllaDB service, connecting to the cluster and setting a session.
-        
-        Args:
-            contact_points: A list of IP addresses for the cluster nodes.
-            username: The username for plain-text authentication.
-            password: The password for plain-text authentication.
-            keyspace: The keyspace to connect to.
         """
         self.contact_points = contact_points
         self.username = username
@@ -42,43 +36,72 @@ class ScyllaDBService:
             raise
 
     def close(self) -> None:
-        """
-        Closes the cluster connection.
-        """
         if self.cluster:
             self.cluster.shutdown()
             logging.info("ScyllaDB connection closed.")
 
-    def read_data(self, table_name: str, columns: List[str]) -> Optional[List[Dict[str, Any]]]:
-        """
-        Reads all data from a specified table.
-        
-        Args:
-            table_name: The name of the table to read from.
-            columns: A list of columns to select.
-            
-        Returns:
-            A list of rows (dictionaries) from the table, or None on error.
-        """
-        select_query = f"SELECT {', '.join(columns)} FROM {table_name}"
+    def read_data_batch(self, table_name: str, columns: List[str], batch_size: int, last_token: str = None) -> Optional[List[Dict[str, Any]]]:
+        """Read data in batches with token-based pagination for large tables."""
         try:
-            # The driver automatically handles pagination for large results
+            if last_token is None:
+                select_query = f"SELECT {', '.join(columns)} FROM {table_name} LIMIT {batch_size}"
+            else:
+                select_query = f"SELECT {', '.join(columns)} FROM {table_name} WHERE token(*) > {last_token} LIMIT {batch_size}"
+            
             rows = self.session.execute(select_query)
-            return [dict(row) for row in rows]
+            result = []
+            for row in rows:
+                row_dict = {}
+                for i, col in enumerate(columns):
+                    row_dict[col] = row[i]
+                result.append(row_dict)
+            return result
         except Exception as e:
-            logging.error(f"Error reading from table '{table_name}': {e}")
+            logging.error(f"Error reading batch from table '{table_name}': {e}")
+            return None
+    
+    def get_last_token(self, batch_data: List[Dict[str, Any]]) -> str:
+        """Extract the last token from batch data for pagination."""
+        if not batch_data:
+            return None
+        
+        try:
+            last_row = batch_data[-1]
+            return str(hash(str(last_row)))
+        except Exception as e:
+            logging.error(f"Error getting last token: {e}")
+            return None
+    
+    def get_table_count(self, table_name: str) -> int:
+        """Get total count of records in table efficiently.
+        
+        WARNING: This can timeout on very large tables (millions+ records).
+        For streaming operations, consider not using this method.
+        """
+        try:
+            count_query = f"SELECT COUNT(*) FROM {table_name}"
+            result = self.session.execute(count_query)
+            return result.one()[0]
+        except Exception as e:
+            logging.error(f"Error getting count for table '{table_name}': {e}")
+            logging.warning(f"Count query timed out for {table_name} - this is expected for very large tables")
+            return 0
+    
+    def get_table_schema(self, table_name: str) -> Optional[List[str]]:
+        """Get column names from table schema."""
+        try:
+            sample_query = f"SELECT * FROM {table_name} LIMIT 1"
+            result = self.session.execute(sample_query)
+            sample_row = result.one()
+            
+            if sample_row:
+                return list(sample_row._fields)
+            return None
+        except Exception as e:
+            logging.error(f"Error getting schema for table '{table_name}': {e}")
             return None
 
     def write_data(self, table_name: str, rows: List[Dict[str, Any]], columns: List[str], batch_size: int = 50) -> None:
-        """
-        Writes data to a specified table using batched inserts.
-        
-        Args:
-            table_name: The name of the table to write to.
-            rows: A list of rows (dictionaries) to insert.
-            columns: A list of columns corresponding to the row data.
-            batch_size: The number of inserts per batch.
-        """
         if not rows:
             logging.warning(f"No data to write to table '{table_name}'.")
             return

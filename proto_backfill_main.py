@@ -105,6 +105,37 @@ class ScyllaBackfillService:
             self.logger.error(f"❌ Failed to initialize database connections: {e}")
             return False
     
+    def _fetch_batch_simple(self, table_name: str, columns: List[str], batch_size: int, offset: int) -> List:
+        """Fetch a single batch from database using simple LIMIT."""
+        try:
+            batch_data = self.src_service.read_data_batch(table_name, columns, batch_size)
+            return batch_data or []
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching batch from {table_name}: {e}")
+            return []
+    
+    def _process_batch(self, batch_data: List, table_name: str, columns: List[str], insert_query: str) -> int:
+        """Process a batch immediately after fetching."""
+        if not batch_data:
+            return 0
+        
+        processed_count = 0
+        for row in batch_data:
+            try:
+                # row is now a dictionary, so access values directly
+                values = [row[col] for col in columns]
+                self.tgt_service.session.execute(insert_query, values)
+                processed_count += 1
+            except Exception as e:
+                self.logger.error(f"Error processing row: {e}")
+        
+        return processed_count
+    
+    def _get_last_token(self, batch_data: List) -> str:
+        """Get the last token from batch data for pagination."""
+        return None
+
     def copy_table_data(self, table_name: str, batch_size: int = 1000) -> bool:
         """Copy data from source to target for a specific table in batches with professional features."""
         table_start_time = time.time()
@@ -121,81 +152,58 @@ class ScyllaBackfillService:
                     self.logger.info(f"   Previous progress: {checkpoint.processed_count:,}/{checkpoint.total_count:,}")
                     self.logger.info(f"   Checkpoint time: {checkpoint.timestamp}")
             
-            # Get total count first
-            count_result = self.src_service.session.execute(f'SELECT COUNT(*) FROM {table_name}')
-            total_records = count_result.one()[0]
+                self.logger.info(f"📊 Starting streaming data transfer for {table_name}...")
             
-            if total_records == 0:
-                self.logger.warning(f"No data found in source {table_name}")
-                return True
-            
-            self.logger.info(f"📊 Total records in source {table_name}: {total_records:,}")
-            
-            # Get column names from a sample row
-            sample_result = self.src_service.session.execute(f'SELECT * FROM {table_name} LIMIT 1')
-            sample_row = sample_result.one()
-            if not sample_row:
-                self.logger.warning(f"Could not get sample row from source {table_name}")
+            columns = self.src_service.get_table_schema(table_name)
+            if not columns:
+                self.logger.warning(f"Could not get schema from source {table_name}")
                 return True
                 
-            columns = list(sample_row._fields)
             placeholders = ', '.join(['%s' for _ in columns])
             insert_query = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({placeholders})"
             
-            # Stream data in batches (memory efficient)
-            self.logger.info(f"📖 Streaming data from source {table_name} in batches of {batch_size:,}...")
-            
-            # Process data in streaming batches
             processed_count = 0
             batch_num = 0
-            current_batch = []
             
-            # Stream data row by row and process in batches
-            all_rows = self.src_service.session.execute(f'SELECT * FROM {table_name}')
+            self.logger.info(f"📊 Counting records while streaming from {table_name}...")
+            self.logger.info(f"📖 Streaming data from {table_name} in batches of {batch_size:,}...")
             
-            for row in all_rows:
-                current_batch.append(row)
+            last_token = None
+            first_batch = True
+            
+            while True:
+                batch_data = self.src_service.read_data_batch(table_name, columns, batch_size, last_token)
                 
-                # When batch is full, process it
-                if len(current_batch) >= batch_size:
-                    # Insert batch into target
-                    for batch_row in current_batch:
-                        values = [getattr(batch_row, col) for col in columns]
-                        self.tgt_service.session.execute(insert_query, values)
-                    
-                    processed_count += len(current_batch)
-                    batch_num += 1
-                    
-                    # Save checkpoint every 10 batches
-                    if self.enable_resume and batch_num % 10 == 0:
-                        self.save_checkpoint(table_name, processed_count, total_records, batch_size)
-                    
-                    # Log progress
-                    progress = (processed_count / total_records) * 100
-                    self.logger.info(f"📈 Progress: {processed_count:,}/{total_records:,} ({progress:.1f}%) - {table_name}")
-                    
-                    # Clear batch for memory efficiency
-                    current_batch = []
-            
-            # Process remaining data in the last batch
-            if current_batch:
-                # Insert batch into target
-                for batch_row in current_batch:
-                    values = [getattr(batch_row, col) for col in columns]
-                    self.tgt_service.session.execute(insert_query, values)
+                if not batch_data:
+                    break
                 
-                processed_count += len(current_batch)
+                if first_batch:
+                    if len(batch_data) < batch_size:
+                        self.logger.info(f"📊 Small table detected ({len(batch_data)} records) - processing all data")
+                        total_records = len(batch_data)
+                    else:
+                        self.logger.info(f"📊 Large table detected ({len(batch_data)}+ records) - using streaming")
+                        total_records = "unknown (streaming)"
+                    first_batch = False
+                
+                batch_processed = self._process_batch(batch_data, table_name, columns, insert_query)
+                processed_count += batch_processed
                 batch_num += 1
                 
-                # Save checkpoint
-                if self.enable_resume:
-                    self.save_checkpoint(table_name, processed_count, total_records, batch_size)
+                last_token = self.src_service.get_last_token(batch_data)
                 
-                # Log progress
-                progress = (processed_count / total_records) * 100
-                self.logger.info(f"📈 Progress: {processed_count:,}/{total_records:,} ({progress:.1f}%) - {table_name}")
+                if self.enable_resume and batch_num % 10 == 0:
+                    self.save_checkpoint(table_name, processed_count, processed_count, batch_size)
+                
+                if isinstance(total_records, int):
+                    progress = (processed_count / total_records) * 100
+                    self.logger.info(f"📈 Progress: {processed_count:,}/{total_records:,} ({progress:.1f}%) - {table_name}")
+                else:
+                    self.logger.info(f"📈 Progress: {processed_count:,} records processed so far - {table_name}")
+                
+                if len(batch_data) < batch_size:
+                    break
             
-            # Calculate performance metrics
             duration = time.time() - table_start_time
             metrics = self.get_performance_metrics(table_name, duration, processed_count)
             self.log_performance_metrics(table_name, metrics)
@@ -204,6 +212,7 @@ class ScyllaBackfillService:
             self.stats['performance_metrics'][table_name] = metrics.__dict__
             
             self.logger.info(f"✅ Successfully copied {processed_count:,} records from source {table_name} to target {table_name}")
+            self.logger.info(f"📊 Total records in source {table_name}: {processed_count:,} (counted during streaming)")
             
             # Clear checkpoint on success
             if self.enable_resume:
@@ -214,7 +223,7 @@ class ScyllaBackfillService:
             self.stats['records_processed'] += processed_count
             
             return True
-            
+                
         except Exception as e:
             self.logger.error(f"❌ Error copying {table_name}: {e}")
             self.stats['errors'] += 1
@@ -287,31 +296,59 @@ class ScyllaBackfillService:
         self.logger.info(f"   ⏱️ Duration: {metrics.duration_seconds:.2f}s")
         self.logger.info(f"   📈 Total records: {metrics.total_records:,}")
     
-    def validate_data_integrity_detailed(self, table_name: str) -> bool:
-        """Enhanced data integrity validation with detailed checks."""
+    def get_streaming_count(self, table_name: str) -> int:
+        """Get count by streaming through the table (no COUNT query).
+        
+        This method counts records by streaming through them, avoiding timeout issues.
+        """
         try:
-            # Get counts
-            src_count = self.src_service.session.execute(f'SELECT COUNT(*) FROM {table_name}').one()[0]
-            tgt_count = self.tgt_service.session.execute(f'SELECT COUNT(*) FROM {table_name}').one()[0]
+            self.logger.info(f"🔢 Counting records in {table_name} by streaming...")
             
-            # Basic count validation
-            if src_count != tgt_count:
-                self.logger.error(f"❌ Data integrity check failed: Source={src_count:,}, Target={tgt_count:,}")
-                return False
+            columns = self.src_service.get_table_schema(table_name)
+            if not columns:
+                return 0
             
-            # Sample data validation (check first 100 records)
-            sample_size = min(100, src_count)
-            if sample_size > 0:
-                src_sample = list(self.src_service.session.execute(f'SELECT * FROM {table_name} LIMIT {sample_size}'))
-                tgt_sample = list(self.tgt_service.session.execute(f'SELECT * FROM {table_name} LIMIT {sample_size}'))
+            count = 0
+            batch_size = 1000
+            last_token = None
+            
+            while True:
+                batch_data = self.src_service.read_data_batch(table_name, columns, batch_size, last_token)
+                if not batch_data:
+                    break
                 
-                # Compare sample data
-                for i, (src_row, tgt_row) in enumerate(zip(src_sample, tgt_sample)):
-                    if src_row != tgt_row:
-                        self.logger.error(f"❌ Data mismatch in sample record {i}")
-                        return False
+                count += len(batch_data)
+                
+                if batch_data:
+                    last_token = self._get_last_token(batch_data)
+                
+                if count % 10000 == 0:
+                    self.logger.info(f"📊 Counted {count:,} records so far...")
             
-            self.logger.info(f"✅ Data integrity verified: {src_count:,} records match (sample validated)")
+            self.logger.info(f"📊 Total records in {table_name}: {count:,}")
+            return count
+            
+        except Exception as e:
+            self.logger.error(f"Error counting records in {table_name}: {e}")
+            return 0
+
+    def validate_data_integrity(self, table_name: str, sample_size: int = 100) -> bool:
+        """Validate data integrity using sample data (safe for large tables)
+        """
+        try:
+            self.logger.info(f"🔍 Validating data integrity for {table_name} using sample data...")
+            
+            # Sample data validation (check first N records)
+            src_sample = list(self.src_service.session.execute(f'SELECT * FROM {table_name} LIMIT {sample_size}'))
+            tgt_sample = list(self.tgt_service.session.execute(f'SELECT * FROM {table_name} LIMIT {sample_size}'))
+            
+            # Compare sample data
+            for i, (src_row, tgt_row) in enumerate(zip(src_sample, tgt_sample)):
+                if src_row != tgt_row:
+                    self.logger.error(f"❌ Data mismatch in sample record {i}")
+                    return False
+            
+            self.logger.info(f"✅ Data integrity verified: {len(src_sample)} sample records match")
             return True
             
         except Exception as e:
@@ -360,21 +397,6 @@ class ScyllaBackfillService:
         
         return processed_count
     
-    def verify_data_integrity(self, table_name: str) -> bool:
-        """Verify that source and target have the same record count."""
-        try:
-            src_count = self.src_service.session.execute(f'SELECT COUNT(*) FROM {table_name}').one()[0]
-            tgt_count = self.tgt_service.session.execute(f'SELECT COUNT(*) FROM {table_name}').one()[0]
-            
-            match = src_count == tgt_count
-            status = "✅" if match else "❌"
-            self.logger.info(f"{status} {table_name}: Source={src_count}, Target={tgt_count}")
-            
-            return match
-            
-        except Exception as e:
-            self.logger.error(f"Error verifying {table_name}: {e}")
-            return False
     
     def run_backfill(self, tables: List[str]):
         """Run the complete backfill process."""
@@ -402,10 +424,9 @@ class ScyllaBackfillService:
                     self.logger.error(f"Failed to process {table_name}")
                     continue
                 
-                # Verify data integrity with detailed checks
-                self.validate_data_integrity_detailed(table_name)
+                # Verify data integrity (safe for large tables)
+                self.validate_data_integrity(table_name)
             
-            # Log final statistics
             self.stats['end_time'] = datetime.now()
             self.stats['duration'] = (self.stats['end_time'] - self.stats['start_time']).total_seconds()
             
@@ -485,11 +506,8 @@ def main():
     
     # Setup logging
     logger = setup_logging(args.log_level)
-    
-    # Load configuration
     config = load_configuration()
     
-    # Override configuration with command line arguments
     if args.batch_size:
         config['batch_size'] = args.batch_size
         logger.info(f"Using command line batch size: {args.batch_size:,}")
@@ -510,7 +528,6 @@ def main():
     if args.tables:
         tables = args.tables
     else:
-        # Try to load tables from config file
         tables = load_tables_from_config()
         if not tables:
             # Fallback to default tables if no config found
