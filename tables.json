@@ -1,0 +1,10 @@
+{
+  "tables": [
+    "logistic_unbundling_details",
+    "product_details",
+    "shipment_details",
+    "sscat_details",
+    "supplier_details",
+    "supplier_sscat_details"
+  ]
+}

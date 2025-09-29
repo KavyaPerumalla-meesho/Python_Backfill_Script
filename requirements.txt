@@ -1,0 +1,13 @@
+# ScyllaDB Data Backfill Script Dependencies
+
+# Database
+cassandra-driver==3.28.0
+
+# Environment
+python-dotenv==1.0.0
+
+# System monitoring
+psutil==5.9.0
+
+# Logging and utilities
+pyyaml==6.0.1
