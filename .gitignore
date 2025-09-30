@@ -71,3 +71,5 @@ htmlcov/
 # Database
 *.db
 *.sqlite3
+.pre-commit-config.yaml
+trufflehog/
